@@ -2,7 +2,7 @@
 智能知识库问答系统 (RAG)
 =========================
 基于 ChromaDB + OpenAI SDK 构建的 RAG 问答系统。
-支持 TXT/MD 文档导入、语义检索、多轮对话。
+支持 TXT/MD/PDF 文档导入、语义检索、多轮对话。
 
 启动方式:
     pip install -r requirements.txt
@@ -10,7 +10,7 @@
     uvicorn app:app --reload
 
 API:
-    POST /api/upload       # 上传文档（MD/TXT）
+    POST /api/upload       # 上传文档（MD/TXT/PDF）
     POST /api/ask          # 提问
     GET  /api/documents    # 查看已导入文档列表
 """
@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
+import pdfplumber
+
 load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -60,6 +62,7 @@ llm_model = os.getenv("LLM_MODEL", "deepseek-chat")
 # ChromaDB
 chroma_client = chromadb.PersistentClient(path=PERSIST_DIR)
 
+
 def get_embedding_function():
     """使用硅基流动的 embedding 模型"""
     return embedding_functions.OpenAIEmbeddingFunction(
@@ -67,6 +70,7 @@ def get_embedding_function():
         api_base=siliconflow_base_url,
         model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
     )
+
 
 def get_collection():
     ef = get_embedding_function()
@@ -80,6 +84,28 @@ def get_collection():
             name=COLLECTION_NAME,
             embedding_function=ef,
         )
+
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """从 PDF 字节流中提取纯文本（使用 pdfplumber + 临时文件）"""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        text_parts = []
+        with pdfplumber.open(tmp_path) as pdf:
+            print(f"[PDF解析] 共 {len(pdf.pages)} 页", flush=True)
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text_parts.append(t)
+        result = "\n".join(text_parts)
+        print(f"[PDF解析] 提取文本 {len(result)} 字符", flush=True)
+        return result
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -117,6 +143,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = 4
 
+
 class AskResponse(BaseModel):
     answer: str
     sources: List[str]
@@ -126,17 +153,25 @@ class AskResponse(BaseModel):
 
 @app.post("/api/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """上传文档，支持 MD / TXT"""
+    """上传文档，支持 MD / TXT / PDF"""
     suffix = Path(file.filename or "default.txt").suffix.lower()
-    supported = {".md", ".txt", ".text", ".markdown"}
+    supported = {".md", ".txt", ".text", ".markdown", ".pdf"}
     if suffix not in supported:
         raise HTTPException(400, f"仅支持 {supported} 格式，当前: {suffix}")
 
     content = await file.read()
     try:
-        text = content.decode("utf-8")
-    except Exception:
-        raise HTTPException(400, "文件编码无法识别，请使用 UTF-8")
+        if suffix == ".pdf":
+            try:
+                text = extract_pdf_text(content)
+            except Exception as pdf_err:
+                raise HTTPException(400, f"PDF 解析失败：{type(pdf_err).__name__}: {pdf_err}")
+        else:
+            text = content.decode("utf-8")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"文件处理失败：{e}")
 
     if not text.strip():
         raise HTTPException(400, "文档内容为空")
